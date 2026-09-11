@@ -1,23 +1,20 @@
 /* ============================================================================
  *  Tamagotchi L.i.f.e. — Motor nativo ARM64 (Via 2)
- *  v0.53 — DESENHAR A TEXTURA REAL (shell do Tamagotchi)
+ *  v0.54 — CORRIGIR ENQUADRAMENTO: quad de ecra inteiro em NDC
  *  ----------------------------------------------------------------------------
- *  Factos confirmados por engenharia inversa do classes.dex (v0.52):
- *   - Os .tgd sao PNG normais RGBA8888 (ex.: body_00000 = 1024x1024).
- *   - OnLoadTexture(String) devolve um INDICE (nao o nome GL). O upload real e:
- *        BitmapFactory.decodeStream -> GLUtils.texImage2D  (RGBA8888, correto).
- *   - Para desenhar: resolver OnGetTextureID(indice) -> NOME GL, e so entao
- *        glBindTexture(GL_TEXTURE_2D, nome).
- *   - Ecra magenta na v0.52 = as 7 texturas carregaram (GameGetPart=1). Faltava
- *        apenas DESENHA-LAS. E o que esta versao faz.
+ *  Sintoma da v0.53: a shell real DESENHA, mas ocupa so ~metade x ~2/3 do ecra,
+ *  encostada ao canto superior esquerdo.
+ *  Causa: a projecao ortografica usava base_w/base_h (480x800), que NAO coincide
+ *  com o glViewport real (definido pela app para a resolucao do dispositivo).
+ *  Correcao: desenhar o quad em COORDENADAS NORMALIZADAS (NDC), com PROJECTION e
+ *  MODELVIEW em identidade. Um quad de (-1,-1) a (1,1) preenche SEMPRE o viewport
+ *  completo, independentemente do seu tamanho. Fim do desalinhamento.
  *
- *  O que a v0.53 mostra: a SHELL real do Tamagotchi (body_00000.tgd) desenhada
- *  em ecra inteiro, com a cor natural (sem modulacao). Prova o pipeline completo
- *  .tgd(PNG) -> Bitmap -> GL -> quad na tela, no motor ARM64.
+ *  Confirmado antes: os .tgd sao PNG RGBA8888; OnLoadTexture devolve INDICE e
+ *  OnGetTextureID devolve o nome GL; a shell e body_00000.tgd.
  *
- *  Correcoes de robustez mantidas da v0.52:
- *   - Recarga de texturas a cada (re)criacao de contexto GL (perda ao adormecer).
- *   - Diagnostico via logcat (id, glIsTexture, glGetError, GL_VENDOR/RENDERER).
+ *  Mantido da v0.52/0.53: recarga por epoca de contexto (perda ao adormecer) e
+ *  diagnostico no logcat.
  * ==========================================================================*/
 #include <jni.h>
 #include <stdlib.h>
@@ -32,32 +29,27 @@
 
 #define NATIVES_CLASS "com/namcobandaigames/tamagotchilife/SampleGameNatives"
 
-/* Texturas a carregar. Indice 0 = a shell que vamos desenhar em ecra inteiro. */
 static const char *const TEX_LIST[] = {
-    "body_00000.tgd",           /* 0: shell azul (1024x1024) -> desenhada       */
-    "Tama2Movie_texture.tgd",   /* 1: atlas do bicho (512x512)                  */
-    "Tama2Movie_texture_c.tgd", /* 2: atlas a cores                             */
-    "seg_00000.tgd",            /* 3: segmentos LCD                             */
-    "seg_icon_00000.tgd",       /* 4: icones de cuidado                         */
-    "font.tgd",                 /* 5: fonte                                     */
-    "number_texture.tgd",       /* 6: digitos                                   */
+    "body_00000.tgd",           /* 0: shell azul -> desenhada em ecra inteiro */
+    "Tama2Movie_texture.tgd",
+    "Tama2Movie_texture_c.tgd",
+    "seg_00000.tgd",
+    "seg_icon_00000.tgd",
+    "font.tgd",
+    "number_texture.tgd",
 };
 #define TEX_COUNT ((int)(sizeof(TEX_LIST)/sizeof(TEX_LIST[0])))
-#define TEX_SHELL 0             /* indice da textura desenhada em ecra inteiro  */
+#define TEX_SHELL 0
 
 typedef struct {
     JavaVM   *vm;
     jclass    natives;
-    jmethodID mLoadTexture;     /* (Ljava/lang/String;)I -> indice   */
-    jmethodID mGetTextureID;    /* (I)I -> nome GL                    */
-    jmethodID mGetTextureW;     /* (I)I                              */
-    jmethodID mGetTextureH;     /* (I)I                              */
+    jmethodID mLoadTexture, mGetTextureID, mGetTextureW, mGetTextureH;
 
-    int base_w, base_h;
-    int real_w, real_h;
+    int base_w, base_h, real_w, real_h;
 
-    int  tex_index[TEX_COUNT];  /* indice devolvido por OnLoadTexture */
-    int  tex_glid[TEX_COUNT];   /* nome GL resolvido por OnGetTextureID */
+    int  tex_index[TEX_COUNT];
+    int  tex_glid[TEX_COUNT];
     int  tex_loaded;
     long gl_epoch, tex_epoch;
 
@@ -117,26 +109,29 @@ static void on_context_created(void){
     for(int i=0;i<TEX_COUNT;i++){ G.tex_index[i]=-1; G.tex_glid[i]=-1; }
     const GLubyte*r=glGetString(GL_RENDERER);
     const GLubyte*v=glGetString(GL_VERSION);
-    LOGI("Contexto GL (re)criado epoca=%ld | %s | %s",
-         G.gl_epoch, r?(const char*)r:"?", v?(const char*)v:"?");
+    /* regista tambem o viewport atual, so para diagnostico */
+    GLint vp[4]={0,0,0,0}; glGetIntegerv(GL_VIEWPORT,vp);
+    LOGI("Contexto GL (re)criado epoca=%ld | %s | %s | viewport=%d,%d,%d,%d",
+         G.gl_epoch, r?(const char*)r:"?", v?(const char*)v:"?", vp[0],vp[1],vp[2],vp[3]);
 }
 
-/* Desenha uma textura (por nome GL) num quad de ecra inteiro. */
+/* Desenha uma textura por nome GL, em ECRA INTEIRO, usando NDC.
+ * Independente de base_w/base_h e do tamanho do viewport. */
 static void draw_fullscreen_tex(int glid){
-    int W=G.base_w>0?G.base_w:480, H=G.base_h>0?G.base_h:800;
-
-    glMatrixMode(GL_PROJECTION); glLoadIdentity();
-    glOrthof(0.0f,(GLfloat)W,(GLfloat)H,0.0f,-1.0f,1.0f);   /* origem no topo-esq */
+    glMatrixMode(GL_PROJECTION); glLoadIdentity();   /* identidade => clip = NDC */
     glMatrixMode(GL_MODELVIEW);  glLoadIdentity();
 
-    glColor4f(1,1,1,1);                    /* cor natural, sem modulacao */
+    glColor4f(1,1,1,1);
     glEnable(GL_TEXTURE_2D);
     glBindTexture(GL_TEXTURE_2D,(GLuint)glid);
     glTexParameterx(GL_TEXTURE_2D,GL_TEXTURE_MIN_FILTER,GL_LINEAR);
     glTexParameterx(GL_TEXTURE_2D,GL_TEXTURE_MAG_FILTER,GL_LINEAR);
 
-    GLfloat v[]={ 0,0,  (GLfloat)W,0,  0,(GLfloat)H,  (GLfloat)W,(GLfloat)H };
-    GLfloat t[]={ 0,0,  1,0,          0,1,           1,1 };
+    /* quad em NDC: (-1,-1)..(1,1). V invertido para a imagem nao ficar de pernas p'o ar.
+     * (topo do ecra = y=+1 ; topo da textura = v=0) */
+    GLfloat v[] = { -1.0f,-1.0f,   1.0f,-1.0f,   -1.0f, 1.0f,   1.0f, 1.0f };
+    GLfloat t[] = {  0.0f, 1.0f,   1.0f, 1.0f,    0.0f, 0.0f,   1.0f, 0.0f };
+
     glEnableClientState(GL_VERTEX_ARRAY);
     glEnableClientState(GL_TEXTURE_COORD_ARRAY);
     glVertexPointer(2,GL_FLOAT,0,v);
@@ -163,8 +158,7 @@ JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM*vm,void*reserved){
         G.mGetTextureH =(*env)->GetStaticMethodID(env,local,"OnGetTextureHeight","(I)I");
         (*env)->ExceptionClear(env);
     } else {(*env)->ExceptionClear(env);LOGE("classe %s nao encontrada",NATIVES_CLASS);}
-    LOGI("Motor ARM64 v0.53 carregado. OnLoadTexture=%s OnGetTextureID=%s.",
-         G.mLoadTexture?"OK":"-", G.mGetTextureID?"OK":"-");
+    LOGI("Motor ARM64 v0.54 carregado. NDC fullscreen quad.");
     return JNI_VERSION_1_6;
 }
 
@@ -174,22 +168,18 @@ JNIEXPORT void JNICALL J(init)(JNIEnv*env,jclass c,jint w,jint h){
     (void)c;
     G.base_w=(w>0)?w:480; G.base_h=(h>0)?h:800; G.real_w=G.base_w; G.real_h=G.base_h;
     G.hunger=80; G.happy=80; G.sick=0; recompute_calling();
-    on_context_created();     /* contexto GL novo (onSurfaceCreated) */
+    on_context_created();
     load_all_textures(env);
-    LOGI("init(%d,%d) base=%dx%d tex=%d/%d",w,h,G.base_w,G.base_h,G.tex_loaded,TEX_COUNT);
+    LOGI("init(%d,%d) tex=%d/%d",w,h,G.tex_loaded,TEX_COUNT);
 }
 
 JNIEXPORT void JNICALL J(main)(JNIEnv*env,jclass c){(void)env;(void)c;LOGI("main()");}
 
 JNIEXPORT void JNICALL J(step)(JNIEnv*env,jclass c){
     (void)c;
-    /* recarrega se o contexto foi recriado sem passar por init */
     if(G.tex_epoch!=G.gl_epoch && G.mLoadTexture) load_all_textures(env);
-
     G.ticks++;
     if((G.ticks%30)==0){ G.hunger=clampi(G.hunger-1,0,100); G.happy=clampi(G.happy-1,0,100); recompute_calling(); }
-
-    /* >>> DESENHA A SHELL REAL, se ja foi carregada e resolvida <<< */
     if(G.tex_glid[TEX_SHELL] >= 0 && glIsTexture((GLuint)G.tex_glid[TEX_SHELL]))
         draw_fullscreen_tex(G.tex_glid[TEX_SHELL]);
 }
@@ -198,10 +188,7 @@ JNIEXPORT void JNICALL J(stop)(JNIEnv*env,jclass c){(void)env;(void)c;LOGI("stop
 JNIEXPORT void JNICALL J(GameTerm)(JNIEnv*env,jclass c){
     (void)c; if(G.natives&&env){(*env)->DeleteGlobalRef(env,G.natives);G.natives=NULL;} LOGI("GameTerm()");
 }
-
-/* Fundo: 0 = preto/vermelho estavel; a shell tapa o ecra por cima. */
 JNIEXPORT jint JNICALL J(GameGetPart)(JNIEnv*env,jclass c){(void)env;(void)c;return 0;}
-
 JNIEXPORT void JNICALL J(GameSetAppRequest)(JNIEnv*env,jclass c,jint req){
     switch(req){case 1:G.hunger=clampi(G.hunger+30,0,100);break;
     case 2:G.happy=clampi(G.happy+30,0,100);break;case 3:G.sick=0;break;
