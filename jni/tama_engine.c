@@ -1,21 +1,27 @@
 /* ============================================================================
  *  Tamagotchi L.i.f.e. — Motor nativo ARM64 (Via 2)
- *  v0.55 — VIEWPORT REAL via EGL: shell preenche o ecra inteiro
+ *  v0.57 — VIEWPORT ROBUSTO: preencher o ecra inteiro sem adivinhar
  *  ----------------------------------------------------------------------------
- *  Sintoma v0.54: com quad NDC a shell continua a ~metade, canto superior esq.
- *  Causa: um quad NDC preenche o VIEWPORT; mas a camada Java definiu glViewport
- *  para a "base screen" (480x800), nao para a resolucao real do ecra. Logo o
- *  quad enche so essa regiao encolhida.
- *  Correcao definitiva: perguntar ao EGL o tamanho REAL da superficie corrente
- *  (eglQuerySurface EGL_WIDTH/EGL_HEIGHT) e forcar glViewport(0,0,W,H) a cada
- *  frame, antes de desenhar. Independente do que o Java configurou.
+ *  Factos confirmados por engenharia inversa do renderer (classe ao):
+ *   - O Java NUNCA chama glViewport. O viewport fica no valor por omissao = o
+ *     tamanho real do framebuffer (o que queremos).
+ *   - init(mJ,mH) recebe o tamanho da superficie; GetBaseScreenWidth/Height=480/800.
  *
- *  IMPORTANTE (build): esta versao usa EGL. No Android.mk acrescenta -lEGL:
- *      LOCAL_LDLIBS := -llog -lGLESv1_CM -lEGL -lm
+ *  Historico de sintomas:
+ *   - v0.53 (glOrtho 480x800):      shell ~1/2 x ~2/3, canto sup-esq.
+ *   - v0.54 (NDC, sem forcar vp):   shell ~1/2 x ~2/3.
+ *   - v0.55/56 (forcar vp=EGL):     shell exatamente 1/4 (sup-esq) -> EGL devolveu
+ *                                   ~metade da resolucao real.
  *
- *  Mantido: .tgd sao PNG RGBA8888; OnLoadTexture->indice, OnGetTextureID->glId;
- *  recarga por epoca de contexto; diagnostico no logcat (agora tambem loga o
- *  tamanho EGL real da superficie).
+ *  Estrategia v0.57: medir QUATRO candidatos de tamanho e forcar glViewport para
+ *  o de MAIOR area (o framebuffer real), sem depender de nenhuma fonte isolada:
+ *     (1) viewport por omissao lido em on_context_created (glGetIntegerv)
+ *     (2) EGL surface (eglQuerySurface)
+ *     (3) init(w,h)
+ *     (4) 480x800 (base, ultimo recurso)
+ *  Loga os quatro para diagnostico. Um quad NDC preenche esse viewport.
+ *
+ *  Android.mk: LOCAL_LDLIBS := -llog -lGLESv1_CM -lEGL -lm
  * ==========================================================================*/
 #include <jni.h>
 #include <stdlib.h>
@@ -48,14 +54,14 @@ typedef struct {
     jclass    natives;
     jmethodID mLoadTexture, mGetTextureID, mGetTextureW, mGetTextureH;
 
-    int base_w, base_h, real_w, real_h;
+    int init_w, init_h;      /* tamanho passado ao init() pelo Java */
 
     int  tex_index[TEX_COUNT];
     int  tex_glid[TEX_COUNT];
     int  tex_loaded;
     long gl_epoch, tex_epoch;
 
-    int  surf_w, surf_h;   /* tamanho REAL da superficie (via EGL) */
+    int  fb_w, fb_h;         /* framebuffer real escolhido (maior area) */
 
     int  hunger, happy, sick, calling;
     long ticks;
@@ -69,31 +75,44 @@ static double now_ms(void){ struct timespec t; clock_gettime(CLOCK_MONOTONIC,&t)
 static int clampi(int v,int lo,int hi){ return v<lo?lo:(v>hi?hi:v); }
 static void recompute_calling(void){ G.calling=(G.hunger<=25||G.happy<=25||G.sick)?1:0; }
 
+static int egl_size(int*w,int*h){
+    EGLDisplay dpy=eglGetCurrentDisplay(); EGLSurface s=eglGetCurrentSurface(EGL_DRAW);
+    if(dpy==EGL_NO_DISPLAY||s==EGL_NO_SURFACE) return 0;
+    EGLint ew=0,eh=0;
+    if(!eglQuerySurface(dpy,s,EGL_WIDTH,&ew)) return 0;
+    if(!eglQuerySurface(dpy,s,EGL_HEIGHT,&eh)) return 0;
+    if(ew<=0||eh<=0) return 0; *w=ew;*h=eh; return 1;
+}
+
+/* Escolhe o framebuffer real = candidato de MAIOR area. Loga todos. */
+static void choose_framebuffer(const char*ctx){
+    GLint vp[4]={0,0,0,0}; glGetIntegerv(GL_VIEWPORT,vp);
+    int ew=0,eh=0; int okegl=egl_size(&ew,&eh);
+    int cand_w[4]={vp[2], okegl?ew:0, G.init_w, 480};
+    int cand_h[4]={vp[3], okegl?eh:0, G.init_h, 800};
+    const char*names[4]={"gl_default_vp","egl_surface","init","base480"};
+    long best=0; int bw=480,bh=800;
+    for(int i=0;i<4;i++){
+        long area=(long)cand_w[i]*(long)cand_h[i];
+        if(cand_w[i]>0 && cand_h[i]>0 && area>best){ best=area; bw=cand_w[i]; bh=cand_h[i]; }
+    }
+    G.fb_w=bw; G.fb_h=bh;
+    LOGI("[%s] candidatos: gl_vp=%dx%d egl=%dx%d(ok=%d) init=%dx%d base=480x800 -> ESCOLHIDO %dx%d",
+         ctx, vp[2],vp[3], ew,eh,okegl, G.init_w,G.init_h, bw,bh);
+    for(int i=0;i<4;i++) LOGI("   cand[%s]=%dx%d",names[i],cand_w[i],cand_h[i]);
+}
+
 static const char *gl_err(GLenum e){
     switch(e){case GL_NO_ERROR:return"NO_ERROR";case GL_INVALID_ENUM:return"INVALID_ENUM";
     case GL_INVALID_VALUE:return"INVALID_VALUE";case GL_INVALID_OPERATION:return"INVALID_OPERATION";
     case GL_OUT_OF_MEMORY:return"OUT_OF_MEMORY";default:return"?";}
 }
-
-/* Pergunta ao EGL o tamanho real da superficie corrente. Devolve 1 se OK. */
-static int query_egl_surface(int *w,int *h){
-    EGLDisplay dpy = eglGetCurrentDisplay();
-    EGLSurface sur = eglGetCurrentSurface(EGL_DRAW);
-    if(dpy==EGL_NO_DISPLAY || sur==EGL_NO_SURFACE) return 0;
-    EGLint ew=0, eh=0;
-    if(!eglQuerySurface(dpy,sur,EGL_WIDTH,&ew))  return 0;
-    if(!eglQuerySurface(dpy,sur,EGL_HEIGHT,&eh)) return 0;
-    if(ew<=0 || eh<=0) return 0;
-    *w=ew; *h=eh; return 1;
-}
-
 static int jcall_int_str(JNIEnv*env,jmethodID m,const char*s){
     if(!env||!G.natives||!m) return -1;
     jstring js=(*env)->NewStringUTF(env,s);
     jint r=(*env)->CallStaticIntMethod(env,G.natives,m,js);
     if((*env)->ExceptionCheck(env)){(*env)->ExceptionClear(env);(*env)->DeleteLocalRef(env,js);return -1;}
-    (*env)->DeleteLocalRef(env,js);
-    return (int)r;
+    (*env)->DeleteLocalRef(env,js); return (int)r;
 }
 static int jcall_int_int(JNIEnv*env,jmethodID m,int a){
     if(!env||!G.natives||!m) return -1;
@@ -101,7 +120,6 @@ static int jcall_int_int(JNIEnv*env,jmethodID m,int a){
     if((*env)->ExceptionCheck(env)){(*env)->ExceptionClear(env);return -1;}
     return (int)r;
 }
-
 static void load_all_textures(JNIEnv*env){
     if(G.tex_epoch==G.gl_epoch && G.tex_loaded>0) return;
     G.tex_loaded=0;
@@ -119,23 +137,18 @@ static void load_all_textures(JNIEnv*env){
     LOGI("=== Texturas (epoca %ld): %d/%d ; shell glId=%d ===",
          G.gl_epoch,G.tex_loaded,TEX_COUNT,G.tex_glid[TEX_SHELL]);
 }
-
 static void on_context_created(void){
     G.gl_epoch++; G.tex_loaded=0;
     for(int i=0;i<TEX_COUNT;i++){ G.tex_index[i]=-1; G.tex_glid[i]=-1; }
     const GLubyte*r=glGetString(GL_RENDERER);
-    GLint vp[4]={0,0,0,0}; glGetIntegerv(GL_VIEWPORT,vp);
-    int ew=0,eh=0; int ok=query_egl_surface(&ew,&eh);
-    if(ok){ G.surf_w=ew; G.surf_h=eh; }
-    LOGI("Contexto GL epoca=%ld | %s | glViewport(Java)=%d,%d,%d,%d | EGL_surface=%dx%d(ok=%d)",
-         G.gl_epoch, r?(const char*)r:"?", vp[0],vp[1],vp[2],vp[3], ew,eh,ok);
+    LOGI("Contexto GL epoca=%ld | %s", G.gl_epoch, r?(const char*)r:"?");
+    choose_framebuffer("on_context_created");
 }
 
-/* Desenha textura por glId, forcando o viewport REAL (EGL) e quad NDC. */
 static void draw_fullscreen_tex(int glid){
-    int w=0,h=0;
-    if(query_egl_surface(&w,&h)){ G.surf_w=w; G.surf_h=h; glViewport(0,0,w,h); }
-    else if(G.surf_w>0 && G.surf_h>0){ glViewport(0,0,G.surf_w,G.surf_h); }
+    /* re-mede a cada frame (o framebuffer pode ter mudado apos o 1o frame) */
+    choose_framebuffer("draw");
+    glViewport(0,0,G.fb_w,G.fb_h);
 
     glMatrixMode(GL_PROJECTION); glLoadIdentity();
     glMatrixMode(GL_MODELVIEW);  glLoadIdentity();
@@ -158,11 +171,10 @@ static void draw_fullscreen_tex(int glid){
     glDisable(GL_TEXTURE_2D);
 }
 
-/* ================================ JNI_OnLoad =============================== */
 JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM*vm,void*reserved){
     (void)reserved; memset(&G,0,sizeof(G));
     for(int i=0;i<TEX_COUNT;i++){G.tex_index[i]=-1;G.tex_glid[i]=-1;}
-    G.gl_epoch=0; G.tex_epoch=-1; G.vm=vm;
+    G.gl_epoch=0; G.tex_epoch=-1; G.init_w=0; G.init_h=0; G.vm=vm;
     JNIEnv*env=NULL;
     if((*vm)->GetEnv(vm,(void**)&env,JNI_VERSION_1_6)!=JNI_OK||!env){LOGE("GetEnv falhou");return JNI_ERR;}
     jclass local=(*env)->FindClass(env,NATIVES_CLASS);
@@ -174,7 +186,7 @@ JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM*vm,void*reserved){
         G.mGetTextureH =(*env)->GetStaticMethodID(env,local,"OnGetTextureHeight","(I)I");
         (*env)->ExceptionClear(env);
     } else {(*env)->ExceptionClear(env);LOGE("classe %s nao encontrada",NATIVES_CLASS);}
-    LOGI("Motor ARM64 v0.55 carregado. Viewport real via EGL.");
+    LOGI("Motor ARM64 v0.57 carregado. Viewport robusto (maior candidato).");
     return JNI_VERSION_1_6;
 }
 
@@ -182,11 +194,11 @@ JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM*vm,void*reserved){
 
 JNIEXPORT void JNICALL J(init)(JNIEnv*env,jclass c,jint w,jint h){
     (void)c;
-    G.base_w=(w>0)?w:480; G.base_h=(h>0)?h:800; G.real_w=G.base_w; G.real_h=G.base_h;
+    G.init_w=(int)w; G.init_h=(int)h;
     G.hunger=80; G.happy=80; G.sick=0; recompute_calling();
     on_context_created();
     load_all_textures(env);
-    LOGI("init(%d,%d) tex=%d/%d surf=%dx%d",w,h,G.tex_loaded,TEX_COUNT,G.surf_w,G.surf_h);
+    LOGI("init(%d,%d) tex=%d/%d fb=%dx%d",w,h,G.tex_loaded,TEX_COUNT,G.fb_w,G.fb_h);
 }
 
 JNIEXPORT void JNICALL J(main)(JNIEnv*env,jclass c){(void)env;(void)c;LOGI("main()");}
@@ -208,7 +220,7 @@ JNIEXPORT jint JNICALL J(GameGetPart)(JNIEnv*env,jclass c){(void)env;(void)c;ret
 JNIEXPORT void JNICALL J(GameSetAppRequest)(JNIEnv*env,jclass c,jint req){
     switch(req){case 1:G.hunger=clampi(G.hunger+30,0,100);break;
     case 2:G.happy=clampi(G.happy+30,0,100);break;case 3:G.sick=0;break;
-    case 0:J(init)(env,c,G.base_w,G.base_h);break;default:break;}
+    case 0:J(init)(env,c,G.init_w,G.init_h);break;default:break;}
     recompute_calling();
 }
 JNIEXPORT void JNICALL J(GameInputSetTouches)(JNIEnv*env,jclass c,jint id,jfloat x,jfloat y,jfloat a,jfloat b){
@@ -219,7 +231,7 @@ JNIEXPORT void JNICALL J(GameInputSetTouches)(JNIEnv*env,jclass c,jint id,jfloat
 JNIEXPORT void JNICALL J(GameInputReleaseTouches)(JNIEnv*env,jclass c,jint id,jfloat x,jfloat y){
     (void)env;(void)c;(void)id;(void)x;(void)y; G.touch_active=0;
 }
-JNIEXPORT jint JNICALL J(GetBaseScreenWidth)(JNIEnv*env,jclass c){(void)env;(void)c;return G.base_w>0?G.base_w:480;}
-JNIEXPORT jint JNICALL J(GetBaseScreenHeight)(JNIEnv*env,jclass c){(void)env;(void)c;return G.base_h>0?G.base_h:800;}
+JNIEXPORT jint JNICALL J(GetBaseScreenWidth)(JNIEnv*env,jclass c){(void)env;(void)c;return 480;}
+JNIEXPORT jint JNICALL J(GetBaseScreenHeight)(JNIEnv*env,jclass c){(void)env;(void)c;return 800;}
 JNIEXPORT void JNICALL J(ThreadCreate)(JNIEnv*env,jclass c,jint a,jint b){(void)env;(void)c;(void)a;(void)b;LOGI("ThreadCreate");}
 JNIEXPORT void JNICALL J(TMGCmakeAlarmInfoData)(JNIEnv*env,jclass c){(void)env;(void)c;LOGI("AlarmInfo");}
