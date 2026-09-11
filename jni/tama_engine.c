@@ -1,22 +1,22 @@
 /* ============================================================================
  *  Tamagotchi L.i.f.e. — Motor nativo ARM64 (Via 2)
- *  v0.58 — CAUSA RAIZ RESOLVIDA: amostrar so o conteudo da textura (UV crop)
+ *  v0.59 — ASPECT-FIT: shell na proporcao correta, centrada (sem deformar)
  *  ----------------------------------------------------------------------------
- *  DESCOBERTA (analise pixel-a-pixel dos .tgd):
- *   - Os .tgd sao PNG power-of-two, mas o desenho util esta no CANTO SUPERIOR
- *     ESQUERDO, com o resto TRANSPARENTE (padding). Ex.: body_00000.tgd e
- *     1024x1024 mas a shell so ocupa 595x732 => 0.581 x 0.715.
- *   - Por isso, ao mapear a textura inteira (UV 0..1) para o ecra, a shell
- *     aparecia sempre num "quadrante" (canto sup-esq), com transparencia a
- *     volta. NAO era o viewport — era o UV. Isto explica TODOS os sintomas
- *     (v0.53: "1/2 largura x 2/3 altura" == 595/1024 x 732/1024).
+ *  v0.58 acertou o UV-crop: a shell (conteudo 595x732 num PNG 1024x1024) passou
+ *  a encher o ecra. Mas ao esticar 595x732 para um ecra muito mais alto, a shell
+ *  ficou ALONGADA.
+ *  Correcao v0.59: desenhar a shell com "aspect-fit" (letterbox): maior escala
+ *  que mantem a proporcao 595:732 e cabe no ecra, centrada. Margens por preencher
+ *  (fundo preto). O calculo usa o tamanho REAL da superficie (EGL), por isso
+ *  funciona em qualquer ecra sem depender de logs.
  *
- *  CORRECAO: desenhar so o sub-retangulo de conteudo (UV 0..u1, 0..v1) esticado
- *  para um quad de ecra inteiro (NDC). Tabela de UV medida por textura; para a
- *  shell u1=595/1024, v1=732/1024. Tambem tentamos OnGetTextureWidth/Height e
- *  logamos, para automatizar nas proximas versoes.
+ *  Matematica (NDC):
+ *   aspect_tex = 595/732 = 0.8128
+ *   aspect_scr = surf_w / surf_h
+ *   se aspect_scr > aspect_tex  -> limita pela ALTURA: sx = aspect_tex/aspect_scr, sy=1
+ *   senao                       -> limita pela LARGURA: sx = 1, sy = aspect_scr/aspect_tex
+ *   quad NDC: x em [-sx,sx], y em [-sy,sy]
  *
- *  Viewport: forcado para o tamanho REAL da superficie (EGL), que enche o ecra.
  *  Android.mk: LOCAL_LDLIBS := -llog -lGLESv1_CM -lEGL -lm
  * ==========================================================================*/
 #include <jni.h>
@@ -33,16 +33,15 @@
 
 #define NATIVES_CLASS "com/namcobandaigames/tamagotchilife/SampleGameNatives"
 
-/* Tabela: nome + UV de conteudo (medido: contentW/PNGw, contentH/PNGh) */
-typedef struct { const char*name; float u1, v1; } TexDef;
+typedef struct { const char*name; float u1, v1; float aspect; } TexDef;
 static const TexDef TEX_LIST[] = {
-    { "body_00000.tgd",           0.5811f, 0.7148f },  /* 0: shell -> desenhada  */
-    { "Tama2Movie_texture.tgd",   0.9258f, 0.3711f },
-    { "Tama2Movie_texture_c.tgd", 1.0000f, 0.9834f },
-    { "seg_00000.tgd",            0.6445f, 0.6094f },
-    { "seg_icon_00000.tgd",       0.9629f, 0.9297f },
-    { "font.tgd",                 0.9883f, 0.3750f },
-    { "number_texture.tgd",       1.0000f, 1.0000f },
+    { "body_00000.tgd",           0.5811f, 0.7148f, 0.8128f },  /* 0: shell (595x732) */
+    { "Tama2Movie_texture.tgd",   0.9258f, 0.3711f, 0.0f },
+    { "Tama2Movie_texture_c.tgd", 1.0000f, 0.9834f, 0.0f },
+    { "seg_00000.tgd",            0.6445f, 0.6094f, 0.0f },
+    { "seg_icon_00000.tgd",       0.9629f, 0.9297f, 0.0f },
+    { "font.tgd",                 0.9883f, 0.3750f, 0.0f },
+    { "number_texture.tgd",       1.0000f, 1.0000f, 0.0f },
 };
 #define TEX_COUNT ((int)(sizeof(TEX_LIST)/sizeof(TEX_LIST[0])))
 #define TEX_SHELL 0
@@ -53,12 +52,10 @@ typedef struct {
     jmethodID mLoadTexture, mGetTextureID, mGetTextureW, mGetTextureH;
 
     int  init_w, init_h;
-
     int  tex_index[TEX_COUNT];
     int  tex_glid[TEX_COUNT];
     int  tex_loaded;
     long gl_epoch, tex_epoch;
-
     int  surf_w, surf_h;
 
     int  hunger, happy, sick, calling;
@@ -81,7 +78,6 @@ static int egl_size(int*w,int*h){
     if(!eglQuerySurface(dpy,s,EGL_HEIGHT,&eh)) return 0;
     if(ew<=0||eh<=0) return 0; *w=ew;*h=eh; return 1;
 }
-
 static const char *gl_err(GLenum e){
     switch(e){case GL_NO_ERROR:return"NO_ERROR";case GL_INVALID_ENUM:return"INVALID_ENUM";
     case GL_INVALID_VALUE:return"INVALID_VALUE";case GL_INVALID_OPERATION:return"INVALID_OPERATION";
@@ -107,13 +103,11 @@ static void load_all_textures(JNIEnv*env){
         int idx=jcall_int_str(env,G.mLoadTexture,TEX_LIST[i].name);
         G.tex_index[i]=idx;
         int glid=(idx>=0)?jcall_int_int(env,G.mGetTextureID,idx):-1;
-        int rw =(idx>=0)?jcall_int_int(env,G.mGetTextureW,idx):-1;
-        int rh =(idx>=0)?jcall_int_int(env,G.mGetTextureH,idx):-1;
         G.tex_glid[i]=glid;
         GLboolean istex=(glid>=0)?glIsTexture((GLuint)glid):GL_FALSE;
         if(idx>=0) G.tex_loaded++;
-        LOGI("tex[%d] '%s' idx=%d glId=%d isTex=%d OnGetW/H=%dx%d UVtab=%.3f,%.3f err=%s",
-             i,TEX_LIST[i].name,idx,glid,(int)istex,rw,rh,TEX_LIST[i].u1,TEX_LIST[i].v1,gl_err(glGetError()));
+        LOGI("tex[%d] '%s' idx=%d glId=%d isTex=%d err=%s",
+             i,TEX_LIST[i].name,idx,glid,(int)istex,gl_err(glGetError()));
     }
     G.tex_epoch=G.gl_epoch;
     LOGI("=== Texturas (epoca %ld): %d/%d ; shell glId=%d ===",
@@ -128,11 +122,20 @@ static void on_context_created(void){
          G.gl_epoch, r?(const char*)r:"?", ew,eh,ok);
 }
 
-/* Desenha o sub-retangulo (0..u1,0..v1) da textura esticado a ECRA INTEIRO. */
-static void draw_tex_content(int glid, float u1, float v1){
+/* Desenha o conteudo (0..u1,0..v1) da textura mantendo 'aspect' (w/h),
+ * centrado no ecra (letterbox). Se aspect<=0, enche o ecra (stretch). */
+static void draw_tex_fit(int glid, float u1, float v1, float aspect){
     int w=0,h=0;
     if(egl_size(&w,&h)){ G.surf_w=w; G.surf_h=h; glViewport(0,0,w,h); }
-    else if(G.surf_w>0){ glViewport(0,0,G.surf_w,G.surf_h); }
+    else if(G.surf_w>0){ w=G.surf_w; h=G.surf_h; glViewport(0,0,w,h); }
+    if(w<=0||h<=0){ w=480; h=800; }
+
+    float sx=1.0f, sy=1.0f;
+    if(aspect>0.0f){
+        float scr = (float)w/(float)h;      /* aspecto do ecra */
+        if(scr > aspect){ sx = aspect/scr; sy = 1.0f; }  /* limita pela altura */
+        else            { sx = 1.0f; sy = scr/aspect; }  /* limita pela largura */
+    }
 
     glMatrixMode(GL_PROJECTION); glLoadIdentity();
     glMatrixMode(GL_MODELVIEW);  glLoadIdentity();
@@ -143,9 +146,8 @@ static void draw_tex_content(int glid, float u1, float v1){
     glTexParameterx(GL_TEXTURE_2D,GL_TEXTURE_MIN_FILTER,GL_LINEAR);
     glTexParameterx(GL_TEXTURE_2D,GL_TEXTURE_MAG_FILTER,GL_LINEAR);
 
-    /* quad NDC ecra inteiro; UV so o conteudo, V invertido (topo textura = v=0) */
-    GLfloat vtx[] = { -1.0f,-1.0f,   1.0f,-1.0f,   -1.0f, 1.0f,   1.0f, 1.0f };
-    GLfloat uv[]  = {  0.0f, v1,     u1,  v1,       0.0f, 0.0f,   u1,  0.0f };
+    GLfloat vtx[] = { -sx,-sy,   sx,-sy,   -sx, sy,   sx, sy };
+    GLfloat uv[]  = { 0.0f, v1,   u1, v1,   0.0f,0.0f,  u1,0.0f };
 
     glEnableClientState(GL_VERTEX_ARRAY);
     glEnableClientState(GL_TEXTURE_COORD_ARRAY);
@@ -172,7 +174,7 @@ JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM*vm,void*reserved){
         G.mGetTextureH =(*env)->GetStaticMethodID(env,local,"OnGetTextureHeight","(I)I");
         (*env)->ExceptionClear(env);
     } else {(*env)->ExceptionClear(env);LOGE("classe %s nao encontrada",NATIVES_CLASS);}
-    LOGI("Motor ARM64 v0.58 carregado. UV-crop do conteudo da textura.");
+    LOGI("Motor ARM64 v0.59 carregado. Aspect-fit da shell.");
     return JNI_VERSION_1_6;
 }
 
@@ -186,18 +188,15 @@ JNIEXPORT void JNICALL J(init)(JNIEnv*env,jclass c,jint w,jint h){
     load_all_textures(env);
     LOGI("init(%d,%d) tex=%d/%d surf=%dx%d",w,h,G.tex_loaded,TEX_COUNT,G.surf_w,G.surf_h);
 }
-
 JNIEXPORT void JNICALL J(main)(JNIEnv*env,jclass c){(void)env;(void)c;LOGI("main()");}
-
 JNIEXPORT void JNICALL J(step)(JNIEnv*env,jclass c){
     (void)c;
     if(G.tex_epoch!=G.gl_epoch && G.mLoadTexture) load_all_textures(env);
     G.ticks++;
     if((G.ticks%30)==0){ G.hunger=clampi(G.hunger-1,0,100); G.happy=clampi(G.happy-1,0,100); recompute_calling(); }
     if(G.tex_glid[TEX_SHELL] >= 0 && glIsTexture((GLuint)G.tex_glid[TEX_SHELL]))
-        draw_tex_content(G.tex_glid[TEX_SHELL], TEX_LIST[TEX_SHELL].u1, TEX_LIST[TEX_SHELL].v1);
+        draw_tex_fit(G.tex_glid[TEX_SHELL], TEX_LIST[TEX_SHELL].u1, TEX_LIST[TEX_SHELL].v1, TEX_LIST[TEX_SHELL].aspect);
 }
-
 JNIEXPORT void JNICALL J(stop)(JNIEnv*env,jclass c){(void)env;(void)c;LOGI("stop()");}
 JNIEXPORT void JNICALL J(GameTerm)(JNIEnv*env,jclass c){
     (void)c; if(G.natives&&env){(*env)->DeleteGlobalRef(env,G.natives);G.natives=NULL;} LOGI("GameTerm()");
