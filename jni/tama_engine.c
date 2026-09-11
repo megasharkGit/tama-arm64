@@ -1,20 +1,21 @@
 /* ============================================================================
  *  Tamagotchi L.i.f.e. — Motor nativo ARM64 (Via 2)
- *  v0.54 — CORRIGIR ENQUADRAMENTO: quad de ecra inteiro em NDC
+ *  v0.55 — VIEWPORT REAL via EGL: shell preenche o ecra inteiro
  *  ----------------------------------------------------------------------------
- *  Sintoma da v0.53: a shell real DESENHA, mas ocupa so ~metade x ~2/3 do ecra,
- *  encostada ao canto superior esquerdo.
- *  Causa: a projecao ortografica usava base_w/base_h (480x800), que NAO coincide
- *  com o glViewport real (definido pela app para a resolucao do dispositivo).
- *  Correcao: desenhar o quad em COORDENADAS NORMALIZADAS (NDC), com PROJECTION e
- *  MODELVIEW em identidade. Um quad de (-1,-1) a (1,1) preenche SEMPRE o viewport
- *  completo, independentemente do seu tamanho. Fim do desalinhamento.
+ *  Sintoma v0.54: com quad NDC a shell continua a ~metade, canto superior esq.
+ *  Causa: um quad NDC preenche o VIEWPORT; mas a camada Java definiu glViewport
+ *  para a "base screen" (480x800), nao para a resolucao real do ecra. Logo o
+ *  quad enche so essa regiao encolhida.
+ *  Correcao definitiva: perguntar ao EGL o tamanho REAL da superficie corrente
+ *  (eglQuerySurface EGL_WIDTH/EGL_HEIGHT) e forcar glViewport(0,0,W,H) a cada
+ *  frame, antes de desenhar. Independente do que o Java configurou.
  *
- *  Confirmado antes: os .tgd sao PNG RGBA8888; OnLoadTexture devolve INDICE e
- *  OnGetTextureID devolve o nome GL; a shell e body_00000.tgd.
+ *  IMPORTANTE (build): esta versao usa EGL. No Android.mk acrescenta -lEGL:
+ *      LOCAL_LDLIBS := -llog -lGLESv1_CM -lEGL -lm
  *
- *  Mantido da v0.52/0.53: recarga por epoca de contexto (perda ao adormecer) e
- *  diagnostico no logcat.
+ *  Mantido: .tgd sao PNG RGBA8888; OnLoadTexture->indice, OnGetTextureID->glId;
+ *  recarga por epoca de contexto; diagnostico no logcat (agora tambem loga o
+ *  tamanho EGL real da superficie).
  * ==========================================================================*/
 #include <jni.h>
 #include <stdlib.h>
@@ -22,6 +23,7 @@
 #include <time.h>
 #include <android/log.h>
 #include <GLES/gl.h>
+#include <EGL/egl.h>
 
 #define LOG_TAG "TamaEngineARM64"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO,  LOG_TAG, __VA_ARGS__)
@@ -30,7 +32,7 @@
 #define NATIVES_CLASS "com/namcobandaigames/tamagotchilife/SampleGameNatives"
 
 static const char *const TEX_LIST[] = {
-    "body_00000.tgd",           /* 0: shell azul -> desenhada em ecra inteiro */
+    "body_00000.tgd",
     "Tama2Movie_texture.tgd",
     "Tama2Movie_texture_c.tgd",
     "seg_00000.tgd",
@@ -53,6 +55,8 @@ typedef struct {
     int  tex_loaded;
     long gl_epoch, tex_epoch;
 
+    int  surf_w, surf_h;   /* tamanho REAL da superficie (via EGL) */
+
     int  hunger, happy, sick, calling;
     long ticks;
     int   touch_active; float touch_x, touch_y;
@@ -69,6 +73,18 @@ static const char *gl_err(GLenum e){
     switch(e){case GL_NO_ERROR:return"NO_ERROR";case GL_INVALID_ENUM:return"INVALID_ENUM";
     case GL_INVALID_VALUE:return"INVALID_VALUE";case GL_INVALID_OPERATION:return"INVALID_OPERATION";
     case GL_OUT_OF_MEMORY:return"OUT_OF_MEMORY";default:return"?";}
+}
+
+/* Pergunta ao EGL o tamanho real da superficie corrente. Devolve 1 se OK. */
+static int query_egl_surface(int *w,int *h){
+    EGLDisplay dpy = eglGetCurrentDisplay();
+    EGLSurface sur = eglGetCurrentSurface(EGL_DRAW);
+    if(dpy==EGL_NO_DISPLAY || sur==EGL_NO_SURFACE) return 0;
+    EGLint ew=0, eh=0;
+    if(!eglQuerySurface(dpy,sur,EGL_WIDTH,&ew))  return 0;
+    if(!eglQuerySurface(dpy,sur,EGL_HEIGHT,&eh)) return 0;
+    if(ew<=0 || eh<=0) return 0;
+    *w=ew; *h=eh; return 1;
 }
 
 static int jcall_int_str(JNIEnv*env,jmethodID m,const char*s){
@@ -108,17 +124,20 @@ static void on_context_created(void){
     G.gl_epoch++; G.tex_loaded=0;
     for(int i=0;i<TEX_COUNT;i++){ G.tex_index[i]=-1; G.tex_glid[i]=-1; }
     const GLubyte*r=glGetString(GL_RENDERER);
-    const GLubyte*v=glGetString(GL_VERSION);
-    /* regista tambem o viewport atual, so para diagnostico */
     GLint vp[4]={0,0,0,0}; glGetIntegerv(GL_VIEWPORT,vp);
-    LOGI("Contexto GL (re)criado epoca=%ld | %s | %s | viewport=%d,%d,%d,%d",
-         G.gl_epoch, r?(const char*)r:"?", v?(const char*)v:"?", vp[0],vp[1],vp[2],vp[3]);
+    int ew=0,eh=0; int ok=query_egl_surface(&ew,&eh);
+    if(ok){ G.surf_w=ew; G.surf_h=eh; }
+    LOGI("Contexto GL epoca=%ld | %s | glViewport(Java)=%d,%d,%d,%d | EGL_surface=%dx%d(ok=%d)",
+         G.gl_epoch, r?(const char*)r:"?", vp[0],vp[1],vp[2],vp[3], ew,eh,ok);
 }
 
-/* Desenha uma textura por nome GL, em ECRA INTEIRO, usando NDC.
- * Independente de base_w/base_h e do tamanho do viewport. */
+/* Desenha textura por glId, forcando o viewport REAL (EGL) e quad NDC. */
 static void draw_fullscreen_tex(int glid){
-    glMatrixMode(GL_PROJECTION); glLoadIdentity();   /* identidade => clip = NDC */
+    int w=0,h=0;
+    if(query_egl_surface(&w,&h)){ G.surf_w=w; G.surf_h=h; glViewport(0,0,w,h); }
+    else if(G.surf_w>0 && G.surf_h>0){ glViewport(0,0,G.surf_w,G.surf_h); }
+
+    glMatrixMode(GL_PROJECTION); glLoadIdentity();
     glMatrixMode(GL_MODELVIEW);  glLoadIdentity();
 
     glColor4f(1,1,1,1);
@@ -127,11 +146,8 @@ static void draw_fullscreen_tex(int glid){
     glTexParameterx(GL_TEXTURE_2D,GL_TEXTURE_MIN_FILTER,GL_LINEAR);
     glTexParameterx(GL_TEXTURE_2D,GL_TEXTURE_MAG_FILTER,GL_LINEAR);
 
-    /* quad em NDC: (-1,-1)..(1,1). V invertido para a imagem nao ficar de pernas p'o ar.
-     * (topo do ecra = y=+1 ; topo da textura = v=0) */
     GLfloat v[] = { -1.0f,-1.0f,   1.0f,-1.0f,   -1.0f, 1.0f,   1.0f, 1.0f };
     GLfloat t[] = {  0.0f, 1.0f,   1.0f, 1.0f,    0.0f, 0.0f,   1.0f, 0.0f };
-
     glEnableClientState(GL_VERTEX_ARRAY);
     glEnableClientState(GL_TEXTURE_COORD_ARRAY);
     glVertexPointer(2,GL_FLOAT,0,v);
@@ -158,7 +174,7 @@ JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM*vm,void*reserved){
         G.mGetTextureH =(*env)->GetStaticMethodID(env,local,"OnGetTextureHeight","(I)I");
         (*env)->ExceptionClear(env);
     } else {(*env)->ExceptionClear(env);LOGE("classe %s nao encontrada",NATIVES_CLASS);}
-    LOGI("Motor ARM64 v0.54 carregado. NDC fullscreen quad.");
+    LOGI("Motor ARM64 v0.55 carregado. Viewport real via EGL.");
     return JNI_VERSION_1_6;
 }
 
@@ -170,7 +186,7 @@ JNIEXPORT void JNICALL J(init)(JNIEnv*env,jclass c,jint w,jint h){
     G.hunger=80; G.happy=80; G.sick=0; recompute_calling();
     on_context_created();
     load_all_textures(env);
-    LOGI("init(%d,%d) tex=%d/%d",w,h,G.tex_loaded,TEX_COUNT);
+    LOGI("init(%d,%d) tex=%d/%d surf=%dx%d",w,h,G.tex_loaded,TEX_COUNT,G.surf_w,G.surf_h);
 }
 
 JNIEXPORT void JNICALL J(main)(JNIEnv*env,jclass c){(void)env;(void)c;LOGI("main()");}
