@@ -1,21 +1,23 @@
 /* ============================================================================
  *  Tamagotchi L.i.f.e. — Motor nativo ARM64 (Via 2)
- *  v0.59 — ASPECT-FIT: shell na proporcao correta, centrada (sem deformar)
+ *  v0.60 — O BICHO VIVO NO LCD  🐣
  *  ----------------------------------------------------------------------------
- *  v0.58 acertou o UV-crop: a shell (conteudo 595x732 num PNG 1024x1024) passou
- *  a encher o ecra. Mas ao esticar 595x732 para um ecra muito mais alto, a shell
- *  ficou ALONGADA.
- *  Correcao v0.59: desenhar a shell com "aspect-fit" (letterbox): maior escala
- *  que mantem a proporcao 595:732 e cabe no ecra, centrada. Margens por preencher
- *  (fundo preto). O calculo usa o tamanho REAL da superficie (EGL), por isso
- *  funciona em qualquer ecra sem depender de logs.
+ *  Conquistas anteriores: shell real desenhada, UV-crop do conteudo (v0.58) e
+ *  aspect-fit na proporcao 595:732 (v0.59).
  *
- *  Matematica (NDC):
- *   aspect_tex = 595/732 = 0.8128
- *   aspect_scr = surf_w / surf_h
- *   se aspect_scr > aspect_tex  -> limita pela ALTURA: sx = aspect_tex/aspect_scr, sy=1
- *   senao                       -> limita pela LARGURA: sx = 1, sy = aspect_scr/aspect_tex
- *   quad NDC: x em [-sx,sx], y em [-sy,sy]
+ *  NOVO nesta versao (dados extraidos por engenharia inversa dos assets):
+ *   - Tama2Movie_rect.bin DESCODIFICADO: big-endian, u32 count=246, depois 246
+ *     registos de 32 bytes = 8 x int32: (srcX, srcY, w, h, pivotX, pivotY, 0, 0)
+ *     -> 225 sprites validos no atlas Tama2Movie_texture.tgd (512x512).
+ *     Bichos identificados: #87-90 Babytchi, #95-104 Marutchi, #105+ evolucoes.
+ *   - Janela LCD da shell MEDIDA: x=144..446, y=245..527 em 595x732
+ *     => u=[0.2420,0.7513]  v=[0.3347,0.7213]
+ *
+ *  Ordem de desenho (a shell tem a janela TRANSPARENTE, por isso vai por cima):
+ *     1) limpa o ecra a preto  (corrige as faixas azuis das margens)
+ *     2) fundo do LCD (verde classico) na janela
+ *     3) o BICHO (sprite 16x16 do atlas), animado entre 2 frames ~1 Hz
+ *     4) a shell por cima, com alpha-blending
  *
  *  Android.mk: LOCAL_LDLIBS := -llog -lGLESv1_CM -lEGL -lm
  * ==========================================================================*/
@@ -33,26 +35,42 @@
 
 #define NATIVES_CLASS "com/namcobandaigames/tamagotchilife/SampleGameNatives"
 
-typedef struct { const char*name; float u1, v1; float aspect; } TexDef;
+/* ---------------- texturas ---------------- */
+#define TEX_SHELL 0
+#define TEX_ATLAS 1
+typedef struct { const char*name; float u1, v1; } TexDef;
 static const TexDef TEX_LIST[] = {
-    { "body_00000.tgd",           0.5811f, 0.7148f, 0.8128f },  /* 0: shell (595x732) */
-    { "Tama2Movie_texture.tgd",   0.9258f, 0.3711f, 0.0f },
-    { "Tama2Movie_texture_c.tgd", 1.0000f, 0.9834f, 0.0f },
-    { "seg_00000.tgd",            0.6445f, 0.6094f, 0.0f },
-    { "seg_icon_00000.tgd",       0.9629f, 0.9297f, 0.0f },
-    { "font.tgd",                 0.9883f, 0.3750f, 0.0f },
-    { "number_texture.tgd",       1.0000f, 1.0000f, 0.0f },
+    { "body_00000.tgd",         0.5811f, 0.7148f },  /* shell: 595x732 de 1024   */
+    { "Tama2Movie_texture.tgd", 0.9258f, 0.3711f },  /* atlas: 474x190 de 512    */
 };
 #define TEX_COUNT ((int)(sizeof(TEX_LIST)/sizeof(TEX_LIST[0])))
-#define TEX_SHELL 0
+
+/* shell: dimensoes do conteudo e proporcao */
+#define SHELL_W 595.0f
+#define SHELL_H 732.0f
+#define SHELL_ASPECT (SHELL_W/SHELL_H)     /* 0.8128 */
+
+/* janela LCD, em fracao do conteudo da shell (medida) */
+#define LCD_U0 0.2420f
+#define LCD_U1 0.7513f
+#define LCD_V0 0.3347f
+#define LCD_V1 0.7213f
+
+/* atlas */
+#define ATLAS_PX 512.0f
+
+/* sprites do bicho (Marutchi): 2 frames de idle, 16x16 no atlas */
+typedef struct { int x,y,w,h; } Rect;
+static const Rect CREATURE[2] = {
+    {  16, 16, 16, 16 },   /* #96 Marutchi, frame A (verificado no rect.bin) */
+    {  32, 16, 16, 16 },   /* #97 Marutchi, frame B                          */
+};
 
 typedef struct {
     JavaVM   *vm;
     jclass    natives;
-    jmethodID mLoadTexture, mGetTextureID, mGetTextureW, mGetTextureH;
+    jmethodID mLoadTexture, mGetTextureID;
 
-    int  init_w, init_h;
-    int  tex_index[TEX_COUNT];
     int  tex_glid[TEX_COUNT];
     int  tex_loaded;
     long gl_epoch, tex_epoch;
@@ -60,6 +78,7 @@ typedef struct {
 
     int  hunger, happy, sick, calling;
     long ticks;
+    double t0;
     int   touch_active; float touch_x, touch_y;
 } TamaState;
 
@@ -77,11 +96,6 @@ static int egl_size(int*w,int*h){
     if(!eglQuerySurface(dpy,s,EGL_WIDTH,&ew)) return 0;
     if(!eglQuerySurface(dpy,s,EGL_HEIGHT,&eh)) return 0;
     if(ew<=0||eh<=0) return 0; *w=ew;*h=eh; return 1;
-}
-static const char *gl_err(GLenum e){
-    switch(e){case GL_NO_ERROR:return"NO_ERROR";case GL_INVALID_ENUM:return"INVALID_ENUM";
-    case GL_INVALID_VALUE:return"INVALID_VALUE";case GL_INVALID_OPERATION:return"INVALID_OPERATION";
-    case GL_OUT_OF_MEMORY:return"OUT_OF_MEMORY";default:return"?";}
 }
 static int jcall_int_str(JNIEnv*env,jmethodID m,const char*s){
     if(!env||!G.natives||!m) return -1;
@@ -101,54 +115,27 @@ static void load_all_textures(JNIEnv*env){
     G.tex_loaded=0;
     for(int i=0;i<TEX_COUNT;i++){
         int idx=jcall_int_str(env,G.mLoadTexture,TEX_LIST[i].name);
-        G.tex_index[i]=idx;
         int glid=(idx>=0)?jcall_int_int(env,G.mGetTextureID,idx):-1;
         G.tex_glid[i]=glid;
-        GLboolean istex=(glid>=0)?glIsTexture((GLuint)glid):GL_FALSE;
-        if(idx>=0) G.tex_loaded++;
-        LOGI("tex[%d] '%s' idx=%d glId=%d isTex=%d err=%s",
-             i,TEX_LIST[i].name,idx,glid,(int)istex,gl_err(glGetError()));
+        if(glid>=0) G.tex_loaded++;
+        LOGI("tex[%d] '%s' idx=%d glId=%d", i, TEX_LIST[i].name, idx, glid);
     }
     G.tex_epoch=G.gl_epoch;
-    LOGI("=== Texturas (epoca %ld): %d/%d ; shell glId=%d ===",
-         G.gl_epoch,G.tex_loaded,TEX_COUNT,G.tex_glid[TEX_SHELL]);
+    LOGI("=== Texturas %d/%d | shell=%d atlas=%d ===",
+         G.tex_loaded,TEX_COUNT,G.tex_glid[TEX_SHELL],G.tex_glid[TEX_ATLAS]);
 }
 static void on_context_created(void){
     G.gl_epoch++; G.tex_loaded=0;
-    for(int i=0;i<TEX_COUNT;i++){ G.tex_index[i]=-1; G.tex_glid[i]=-1; }
-    const GLubyte*r=glGetString(GL_RENDERER);
+    for(int i=0;i<TEX_COUNT;i++) G.tex_glid[i]=-1;
     int ew=0,eh=0,ok=egl_size(&ew,&eh); if(ok){G.surf_w=ew;G.surf_h=eh;}
-    LOGI("Contexto GL epoca=%ld | %s | EGL_surface=%dx%d(ok=%d)",
-         G.gl_epoch, r?(const char*)r:"?", ew,eh,ok);
+    LOGI("Contexto GL epoca=%ld | EGL_surface=%dx%d(ok=%d)",G.gl_epoch,ew,eh,ok);
 }
 
-/* Desenha o conteudo (0..u1,0..v1) da textura mantendo 'aspect' (w/h),
- * centrado no ecra (letterbox). Se aspect<=0, enche o ecra (stretch). */
-static void draw_tex_fit(int glid, float u1, float v1, float aspect){
-    int w=0,h=0;
-    if(egl_size(&w,&h)){ G.surf_w=w; G.surf_h=h; glViewport(0,0,w,h); }
-    else if(G.surf_w>0){ w=G.surf_w; h=G.surf_h; glViewport(0,0,w,h); }
-    if(w<=0||h<=0){ w=480; h=800; }
-
-    float sx=1.0f, sy=1.0f;
-    if(aspect>0.0f){
-        float scr = (float)w/(float)h;      /* aspecto do ecra */
-        if(scr > aspect){ sx = aspect/scr; sy = 1.0f; }  /* limita pela altura */
-        else            { sx = 1.0f; sy = scr/aspect; }  /* limita pela largura */
-    }
-
-    glMatrixMode(GL_PROJECTION); glLoadIdentity();
-    glMatrixMode(GL_MODELVIEW);  glLoadIdentity();
-
-    glColor4f(1,1,1,1);
-    glEnable(GL_TEXTURE_2D);
-    glBindTexture(GL_TEXTURE_2D,(GLuint)glid);
-    glTexParameterx(GL_TEXTURE_2D,GL_TEXTURE_MIN_FILTER,GL_LINEAR);
-    glTexParameterx(GL_TEXTURE_2D,GL_TEXTURE_MAG_FILTER,GL_LINEAR);
-
-    GLfloat vtx[] = { -sx,-sy,   sx,-sy,   -sx, sy,   sx, sy };
-    GLfloat uv[]  = { 0.0f, v1,   u1, v1,   0.0f,0.0f,  u1,0.0f };
-
+/* --------- helpers de desenho --------- */
+static void quad_tex(float x0,float y0,float x1,float y1,
+                     float u0,float v0,float u1,float v1){
+    GLfloat vtx[]={ x0,y0,  x1,y0,  x0,y1,  x1,y1 };
+    GLfloat uv []={ u0,v1,  u1,v1,  u0,v0,  u1,v0 };
     glEnableClientState(GL_VERTEX_ARRAY);
     glEnableClientState(GL_TEXTURE_COORD_ARRAY);
     glVertexPointer(2,GL_FLOAT,0,vtx);
@@ -156,13 +143,93 @@ static void draw_tex_fit(int glid, float u1, float v1, float aspect){
     glDrawArrays(GL_TRIANGLE_STRIP,0,4);
     glDisableClientState(GL_TEXTURE_COORD_ARRAY);
     glDisableClientState(GL_VERTEX_ARRAY);
+}
+static void quad_color(float x0,float y0,float x1,float y1,
+                       float r,float g,float b,float a){
+    glDisable(GL_TEXTURE_2D);
+    glColor4f(r,g,b,a);
+    GLfloat vtx[]={ x0,y0, x1,y0, x0,y1, x1,y1 };
+    glEnableClientState(GL_VERTEX_ARRAY);
+    glVertexPointer(2,GL_FLOAT,0,vtx);
+    glDrawArrays(GL_TRIANGLE_STRIP,0,4);
+    glDisableClientState(GL_VERTEX_ARRAY);
+    glColor4f(1,1,1,1);
+}
+
+/* converte fracao UV da shell -> NDC, dado o rect da shell em NDC */
+static float sx_of(float u,float sx){ return sx*(2.0f*u-1.0f); }
+static float sy_of(float v,float sy){ return sy*(1.0f-2.0f*v); }
+
+static void render(void){
+    int w=0,h=0;
+    if(egl_size(&w,&h)){ G.surf_w=w; G.surf_h=h; }
+    else { w=G.surf_w; h=G.surf_h; }
+    if(w<=0||h<=0){ w=480; h=800; }
+    glViewport(0,0,w,h);
+
+    /* 1) fundo preto (substitui as faixas azuis) */
+    glClearColor(0.0f,0.0f,0.0f,1.0f);
+    glClear(GL_COLOR_BUFFER_BIT);
+
+    glMatrixMode(GL_PROJECTION); glLoadIdentity();
+    glMatrixMode(GL_MODELVIEW);  glLoadIdentity();
+    glEnable(GL_BLEND);
+    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+
+    /* aspect-fit da shell */
+    float scr=(float)w/(float)h, sx=1.0f, sy=1.0f;
+    if(scr > SHELL_ASPECT){ sx = SHELL_ASPECT/scr; sy = 1.0f; }
+    else                  { sx = 1.0f; sy = scr/SHELL_ASPECT; }
+
+    /* janela LCD em NDC */
+    float lx0=sx_of(LCD_U0,sx), lx1=sx_of(LCD_U1,sx);
+    float ly0=sy_of(LCD_V0,sy), ly1=sy_of(LCD_V1,sy);  /* ly0=topo, ly1=fundo */
+
+    /* 2) fundo do LCD (verde classico) */
+    quad_color(lx0,ly1,lx1,ly0, 0.70f,0.78f,0.55f,1.0f);
+
+    /* 3) o BICHO, centrado no LCD, quadrado em pixeis de ecra */
+    if(G.tex_glid[TEX_ATLAS]>=0 && glIsTexture((GLuint)G.tex_glid[TEX_ATLAS])){
+        int frame = (int)((now_ms()-G.t0)/700.0) & 1;      /* ~1.4 Hz */
+        const Rect*R=&CREATURE[frame];
+
+        /* lado do bicho = 42% da largura da janela, em pixeis da shell */
+        float side_px = 0.50f*(LCD_U1-LCD_U0)*SHELL_W;     /* ~152 px */
+        float du = side_px/SHELL_W;                        /* fracao horizontal */
+        float dv = side_px/SHELL_H;                        /* mesma medida vertical */
+        float ucx=(LCD_U0+LCD_U1)*0.5f, vcy=(LCD_V0+LCD_V1)*0.5f;
+
+        float cx0=sx_of(ucx-du*0.5f,sx), cx1=sx_of(ucx+du*0.5f,sx);
+        float cy0=sy_of(vcy-dv*0.5f,sy), cy1=sy_of(vcy+dv*0.5f,sy);
+
+        float au0=R->x/ATLAS_PX,  au1=(R->x+R->w)/ATLAS_PX;
+        float av0=R->y/ATLAS_PX,  av1=(R->y+R->h)/ATLAS_PX;
+
+        glEnable(GL_TEXTURE_2D);
+        glBindTexture(GL_TEXTURE_2D,(GLuint)G.tex_glid[TEX_ATLAS]);
+        /* NEAREST: pixel-art nitida, como o LCD original */
+        glTexParameterx(GL_TEXTURE_2D,GL_TEXTURE_MIN_FILTER,GL_NEAREST);
+        glTexParameterx(GL_TEXTURE_2D,GL_TEXTURE_MAG_FILTER,GL_NEAREST);
+        glColor4f(1,1,1,1);
+        quad_tex(cx0,cy1,cx1,cy0, au0,av0,au1,av1);
+    }
+
+    /* 4) a shell POR CIMA (janela transparente deixa ver o LCD) */
+    if(G.tex_glid[TEX_SHELL]>=0 && glIsTexture((GLuint)G.tex_glid[TEX_SHELL])){
+        glEnable(GL_TEXTURE_2D);
+        glBindTexture(GL_TEXTURE_2D,(GLuint)G.tex_glid[TEX_SHELL]);
+        glTexParameterx(GL_TEXTURE_2D,GL_TEXTURE_MIN_FILTER,GL_LINEAR);
+        glTexParameterx(GL_TEXTURE_2D,GL_TEXTURE_MAG_FILTER,GL_LINEAR);
+        glColor4f(1,1,1,1);
+        quad_tex(-sx,-sy,sx,sy, 0.0f,0.0f,TEX_LIST[TEX_SHELL].u1,TEX_LIST[TEX_SHELL].v1);
+    }
     glDisable(GL_TEXTURE_2D);
 }
 
 JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM*vm,void*reserved){
     (void)reserved; memset(&G,0,sizeof(G));
-    for(int i=0;i<TEX_COUNT;i++){G.tex_index[i]=-1;G.tex_glid[i]=-1;}
-    G.gl_epoch=0; G.tex_epoch=-1; G.vm=vm;
+    for(int i=0;i<TEX_COUNT;i++) G.tex_glid[i]=-1;
+    G.gl_epoch=0; G.tex_epoch=-1; G.vm=vm; G.t0=now_ms();
     JNIEnv*env=NULL;
     if((*vm)->GetEnv(vm,(void**)&env,JNI_VERSION_1_6)!=JNI_OK||!env){LOGE("GetEnv falhou");return JNI_ERR;}
     jclass local=(*env)->FindClass(env,NATIVES_CLASS);
@@ -170,11 +237,9 @@ JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM*vm,void*reserved){
         G.natives=(jclass)(*env)->NewGlobalRef(env,local);
         G.mLoadTexture =(*env)->GetStaticMethodID(env,local,"OnLoadTexture","(Ljava/lang/String;)I");
         G.mGetTextureID=(*env)->GetStaticMethodID(env,local,"OnGetTextureID","(I)I");
-        G.mGetTextureW =(*env)->GetStaticMethodID(env,local,"OnGetTextureWidth","(I)I");
-        G.mGetTextureH =(*env)->GetStaticMethodID(env,local,"OnGetTextureHeight","(I)I");
         (*env)->ExceptionClear(env);
     } else {(*env)->ExceptionClear(env);LOGE("classe %s nao encontrada",NATIVES_CLASS);}
-    LOGI("Motor ARM64 v0.59 carregado. Aspect-fit da shell.");
+    LOGI("Motor ARM64 v0.60 carregado. Bicho no LCD.");
     return JNI_VERSION_1_6;
 }
 
@@ -182,20 +247,18 @@ JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM*vm,void*reserved){
 
 JNIEXPORT void JNICALL J(init)(JNIEnv*env,jclass c,jint w,jint h){
     (void)c;
-    G.init_w=(int)w; G.init_h=(int)h;
-    G.hunger=80; G.happy=80; G.sick=0; recompute_calling();
+    G.hunger=80; G.happy=80; G.sick=0; recompute_calling(); G.t0=now_ms();
     on_context_created();
     load_all_textures(env);
-    LOGI("init(%d,%d) tex=%d/%d surf=%dx%d",w,h,G.tex_loaded,TEX_COUNT,G.surf_w,G.surf_h);
+    LOGI("init(%d,%d) tex=%d/%d",w,h,G.tex_loaded,TEX_COUNT);
 }
 JNIEXPORT void JNICALL J(main)(JNIEnv*env,jclass c){(void)env;(void)c;LOGI("main()");}
 JNIEXPORT void JNICALL J(step)(JNIEnv*env,jclass c){
     (void)c;
     if(G.tex_epoch!=G.gl_epoch && G.mLoadTexture) load_all_textures(env);
     G.ticks++;
-    if((G.ticks%30)==0){ G.hunger=clampi(G.hunger-1,0,100); G.happy=clampi(G.happy-1,0,100); recompute_calling(); }
-    if(G.tex_glid[TEX_SHELL] >= 0 && glIsTexture((GLuint)G.tex_glid[TEX_SHELL]))
-        draw_tex_fit(G.tex_glid[TEX_SHELL], TEX_LIST[TEX_SHELL].u1, TEX_LIST[TEX_SHELL].v1, TEX_LIST[TEX_SHELL].aspect);
+    if((G.ticks%1800)==0){ G.hunger=clampi(G.hunger-1,0,100); G.happy=clampi(G.happy-1,0,100); recompute_calling(); }
+    render();
 }
 JNIEXPORT void JNICALL J(stop)(JNIEnv*env,jclass c){(void)env;(void)c;LOGI("stop()");}
 JNIEXPORT void JNICALL J(GameTerm)(JNIEnv*env,jclass c){
@@ -204,9 +267,8 @@ JNIEXPORT void JNICALL J(GameTerm)(JNIEnv*env,jclass c){
 JNIEXPORT jint JNICALL J(GameGetPart)(JNIEnv*env,jclass c){(void)env;(void)c;return 0;}
 JNIEXPORT void JNICALL J(GameSetAppRequest)(JNIEnv*env,jclass c,jint req){
     switch(req){case 1:G.hunger=clampi(G.hunger+30,0,100);break;
-    case 2:G.happy=clampi(G.happy+30,0,100);break;case 3:G.sick=0;break;
-    case 0:J(init)(env,c,G.init_w,G.init_h);break;default:break;}
-    recompute_calling();
+    case 2:G.happy=clampi(G.happy+30,0,100);break;case 3:G.sick=0;break;default:break;}
+    recompute_calling(); (void)env; (void)c;
 }
 JNIEXPORT void JNICALL J(GameInputSetTouches)(JNIEnv*env,jclass c,jint id,jfloat x,jfloat y,jfloat a,jfloat b){
     (void)env;(void)c;(void)id;(void)a;(void)b; G.touch_active=1;G.touch_x=x;G.touch_y=y;
